@@ -7,24 +7,24 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db")
 
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"prepare_threshold": None} if DATABASE_URL and "pooler.supabase" in DATABASE_URL else {}
-)
+engine_args = {}
+if DATABASE_URL.startswith("postgresql") and "pooler.supabase" in DATABASE_URL:
+    engine_args["connect_args"] = {"prepare_threshold": None}
 
+engine = create_engine(DATABASE_URL, **engine_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- Модели БД ---
+# --- Таблицы БД ---
 
 class CategoryBudgetDB(Base):
     __tablename__ = "category_budgets"
 
     id = Column(Integer, primary_key=True, index=True)
     category = Column(String, unique=True, nullable=False, index=True)
-    allocated_amount = Column(Float, default=0.0)  # Выделено из дохода
+    allocated_amount = Column(Float, default=0.0)
 
 class TransactionDB(Base):
     __tablename__ = "transactions"
@@ -38,7 +38,7 @@ class TransactionDB(Base):
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Конвертный Семейный Бюджет")
+app = FastAPI(title="ProFinance Analytics Dashboard")
 
 def get_db():
     db = SessionLocal()
@@ -47,7 +47,7 @@ def get_db():
     finally:
         db.close()
 
-# --- Pydantic Схемы ---
+# --- Схемы данных ---
 
 class TransactionCreate(BaseModel):
     title: str
@@ -70,7 +70,7 @@ class BudgetResponse(BudgetCreate):
     class Config:
         from_attributes = True
 
-# --- API ---
+# --- API Эндпоинты ---
 
 @app.get("/")
 def read_root():
@@ -85,11 +85,12 @@ def create_transaction(tx: TransactionCreate, db: Session = Depends(get_db)):
     db_tx = TransactionDB(**tx.model_dump())
     db.add(db_tx)
     
-    # Автосоздание категории без лимита, если ее еще нет
+    # Автоматически создаём бюджетную категорию, если её ещё не было
     if tx.type == "expense":
-        existing_budget = db.query(CategoryBudgetDB).filter_by(category=tx.category).first()
-        if not existing_budget:
-            db.add(CategoryBudgetDB(category=tx.category, allocated_amount=0.0))
+        cat_clean = tx.category.strip()
+        existing = db.query(CategoryBudgetDB).filter_by(category=cat_clean).first()
+        if not existing:
+            db.add(CategoryBudgetDB(category=cat_clean, allocated_amount=0.0))
             
     db.commit()
     db.refresh(db_tx)
@@ -110,18 +111,27 @@ def get_budgets(db: Session = Depends(get_db)):
 
 @app.post("/api/budgets", response_model=BudgetResponse)
 def set_budget(budget: BudgetCreate, db: Session = Depends(get_db)):
-    existing = db.query(CategoryBudgetDB).filter_by(category=budget.category).first()
+    cat_clean = budget.category.strip()
+    existing = db.query(CategoryBudgetDB).filter_by(category=cat_clean).first()
     if existing:
         existing.allocated_amount = budget.allocated_amount
         db.commit()
         db.refresh(existing)
         return existing
     else:
-        new_budget = CategoryBudgetDB(**budget.model_dump())
-        db.add(new_budget)
+        new_b = CategoryBudgetDB(category=cat_clean, allocated_amount=budget.allocated_amount)
+        db.add(new_b)
         db.commit()
-        db.refresh(new_budget)
-        return new_budget
+        db.refresh(new_b)
+        return new_b
+
+@app.delete("/api/budgets/{cat_name}")
+def delete_budget(cat_name: str, db: Session = Depends(get_db)):
+    b = db.query(CategoryBudgetDB).filter_by(category=cat_name).first()
+    if b:
+        db.delete(b)
+        db.commit()
+    return {"status": "success"}
 
 @app.get("/api/summary")
 def get_summary(db: Session = Depends(get_db)):
@@ -131,14 +141,11 @@ def get_summary(db: Session = Depends(get_db)):
     total_income = sum(t.amount for t in transactions if t.type == "income")
     total_expense = sum(t.amount for t in transactions if t.type == "expense")
     total_allocated = sum(b.allocated_amount for b in budgets)
-    
-    # Нераспределенный доход
-    unallocated_income = total_income - total_allocated
 
     return {
         "total_income": total_income,
         "total_expense": total_expense,
         "total_allocated": total_allocated,
-        "unallocated_income": unallocated_income,
+        "unallocated_income": total_income - total_allocated,
         "real_balance": total_income - total_expense
     }
