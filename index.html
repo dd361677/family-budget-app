@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Семейный Бюджет</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 20px auto; padding: 0 20px; background: #f4f7f6; }
+        .cards { display: flex; gap: 15px; margin-bottom: 20px; }
+        .card { flex: 1; padding: 15px; background: #fff; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); text-align: center; }
+        .card.balance { background: #e3f2fd; }
+        .card.income { background: #e8f5e9; }
+        .card.expense { background: #ffebee; }
+        form { background: #fff; padding: 15px; border-radius: 8px; margin-bottom: 20px; display: flex; gap: 10px; flex-wrap: wrap; }
+        input, select, button { padding: 10px; font-size: 14px; border: 1px solid #ccc; border-radius: 4px; }
+        button { background: #28a745; color: white; border: none; cursor: pointer; }
+        button:hover { background: #218838; }
+        table { width: 100%; background: #fff; border-collapse: collapse; border-radius: 8px; overflow: hidden; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        .del-btn { background: #dc3545; padding: 5px 10px; font-size: 12px; }
+    </style>
+</head>
+<body>
+
+    <h2>Управление Семейным Бюджетом</h2>
+
+    <div class="cards">
+        <div class="card balance">
+            <h3>Текущий Остаток</h3>
+            <p id="balance">0 ₸</p>
+        </div>
+        <div class="card income">
+            <h3>Всего Доходов</h3>
+            <p id="total-income">0 ₸</p>
+        </div>
+        <div class="card expense">
+            <h3>Всего Расходов</h3>
+            <p id="total-expense">0 ₸</p>
+        </div>
+    </div>
+
+    <form id="tx-form">
+        <input type="text" id="title" placeholder="Описание (напр. Продукты)" required>
+        <input type="number" step="0.01" id="amount" placeholder="Сумма" required>
+        <select id="type">
+            <option value="expense">Расход</option>
+            <option value="income">Доход</option>
+        </select>
+        <input type="text" id="category" placeholder="Категория" value="Общее">
+        <button type="submit">Добавить</button>
+    </form>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Описание</th>
+                <th>Категория</th>
+                <th>Тип</th>
+                <th>Сумма</th>
+                <th>Действие</th>
+            </tr>
+        </thead>
+        <tbody id="tx-table"></tbody>
+    </table>
+
+    <script>
+        async function loadSummary() {
+            const res = await fetch('/api/summary');
+            const data = await res.json();
+            document.getElementById('balance').innerText = data.balance.toFixed(2) + ' ₸';
+            document.getElementById('total-income').innerText = data.income ? data.income.toFixed(2) + ' ₸' : data.total_income.toFixed(2) + ' ₸';
+            document.getElementById('total-expense').innerText = data.total_expense.toFixed(2) + ' ₸';
+        }
+
+        async function loadTransactions() {
+            const res = await fetch('/api/transactions');
+            const data = await res.json();
+            const tbody = document.getElementById('tx-table');
+            tbody.innerHTML = '';
+            
+            data.forEach(item => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td>${item.title}</td>
+                    <td>${item.category}</td>
+                    <td>${item.type === 'income' ? 'Доход' : 'Расход'}</td>
+                    <td style="color: ${item.type === 'income' ? 'green' : 'red'}">${item.amount} ₸</td>
+                    <td><button class="del-btn" onclick="deleteTx(${item.id})">Удалить</button></td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        document.getElementById('tx-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const title = document.getElementById('title').value;
+            const amount = parseFloat(document.getElementById('amount').value);
+            const type = document.getElementById('type').value;
+            const category = document.getElementById('category').value;
+
+            await fetch('/api/transactions', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ title, amount, type, category })
+            });
+
+            document.getElementById('title').value = '';
+            document.getElementById('amount').value = '';
+            loadSummary();
+            loadTransactions();
+        });
+
+        async function deleteTx(id) {
+            await fetch(`/api/transactions/${id}`, { method: 'DELETE' });
+            loadSummary();
+            loadTransactions();
+        }
+
+        loadSummary();
+        loadTransactions();
+    </script>
+</body>
+</html>
