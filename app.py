@@ -1,23 +1,32 @@
 import os
+from typing import List, Optional
 from datetime import datetime
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
-from sqlalchemy.orm import declarative_base, sessionmaker
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey
+from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./budget.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-if "sqlite" in DATABASE_URL:
-    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-else:
-    engine = create_engine(DATABASE_URL)
+# Отключаем prepared statements для работы с Supavisor Pooler
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"prepare_threshold": None} if DATABASE_URL and "pooler.supabase" in DATABASE_URL else {}
+)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+# --- Модели БД ---
+
+class CategoryBudgetDB(Base):
+    __tablename__ = "category_budgets"
+
+    id = Column(Integer, primary_key=True, index=True)
+    category = Column(String, unique=True, nullable=False, index=True)
+    allocated_amount = Column(Float, default=0.0)  # Сколько выделено денег
 
 class TransactionDB(Base):
     __tablename__ = "transactions"
@@ -25,74 +34,111 @@ class TransactionDB(Base):
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String, nullable=False)
     amount = Column(Float, nullable=False)
-    type = Column(String, nullable=False)  # "income" или "expense"
-    category = Column(String, default="Разное")
+    type = Column(String, nullable=False)  # 'income' или 'expense'
+    category = Column(String, nullable=False, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI()
+app = FastAPI(title="Семейный Бюджет и Планирование")
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# --- Pydantic Схемы ---
 
 class TransactionCreate(BaseModel):
     title: str
     amount: float
     type: str
-    category: str = "Разное"
+    category: str
 
-@app.get("/", response_class=HTMLResponse)
+class TransactionResponse(TransactionCreate):
+    id: int
+    created_at: datetime
+    class Config:
+        from_attributes = True
+
+class BudgetCreate(BaseModel):
+    category: str
+    allocated_amount: float
+
+class BudgetResponse(BudgetCreate):
+    id: int
+    class Config:
+        from_attributes = True
+
+# --- API Endpoints ---
+
+@app.get("/")
 def read_root():
-    with open("index.html", "r", encoding="utf-8") as f:
-        return f.read()
+    return FileResponse("index.html")
 
-@app.get("/api/summary")
-def get_summary():
-    db = SessionLocal()
-    transactions = db.query(TransactionDB).all()
+# Операции (Транзакции)
+@app.get("/api/transactions", response_model=List[TransactionResponse])
+def get_transactions(db: Session = Depends(get_db)):
+    return db.query(TransactionDB).order_by(TransactionDB.created_at.desc()).all()
+
+@app.post("/api/transactions", response_model=TransactionResponse)
+def create_transaction(tx: TransactionCreate, db: Session = Depends(get_db)):
+    db_tx = TransactionDB(**tx.model_dump())
+    db.add(db_tx)
     
+    # Если для этой категории ещё нет бюджета, автоматически создаём с нулевым лимитом
+    existing_budget = db.query(CategoryBudgetDB).filter_by(category=tx.category).first()
+    if not existing_budget:
+        db.add(CategoryBudgetDB(category=tx.category, allocated_amount=0.0))
+        
+    db.commit()
+    db.refresh(db_tx)
+    return db_tx
+
+@app.delete("/api/transactions/{tx_id}")
+def delete_transaction(tx_id: int, db: Session = Depends(get_db)):
+    tx = db.query(TransactionDB).filter(TransactionDB.id == tx_id).first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Транзакция не найдена")
+    db.delete(tx)
+    db.commit()
+    return {"status": "success"}
+
+# Бюджеты по категориям
+@app.get("/api/budgets", response_model=List[BudgetResponse])
+def get_budgets(db: Session = Depends(get_db)):
+    return db.query(CategoryBudgetDB).all()
+
+@app.post("/api/budgets", response_model=BudgetResponse)
+def set_budget(budget: BudgetCreate, db: Session = Depends(get_db)):
+    existing = db.query(CategoryBudgetDB).filter_by(category=budget.category).first()
+    if existing:
+        existing.allocated_amount = budget.allocated_amount
+        db.commit()
+        db.refresh(existing)
+        return existing
+    else:
+        new_budget = CategoryBudgetDB(**budget.model_dump())
+        db.add(new_budget)
+        db.commit()
+        db.refresh(new_budget)
+        return new_budget
+
+# Общая сводка
+@app.get("/api/summary")
+def get_summary(db: Session = Depends(get_db)):
+    transactions = db.query(TransactionDB).all()
+    budgets = db.query(CategoryBudgetDB).all()
+
     total_income = sum(t.amount for t in transactions if t.type == "income")
     total_expense = sum(t.amount for t in transactions if t.type == "expense")
-    balance = total_income - total_expense
-    
-    db.close()
+    total_budgeted = sum(b.allocated_amount for b in budgets)
+
     return {
         "total_income": total_income,
         "total_expense": total_expense,
-        "balance": balance
+        "balance": total_income - total_expense,
+        "total_budgeted": total_budgeted
     }
-
-@app.get("/api/transactions")
-def get_transactions():
-    db = SessionLocal()
-    transactions = db.query(TransactionDB).order_by(TransactionDB.created_at.desc()).all()
-    db.close()
-    return transactions
-
-@app.post("/api/transactions")
-def add_transaction(item: TransactionCreate):
-    if item.type not in ["income", "expense"]:
-        raise HTTPException(status_code=400, detail="Неверный тип операции")
-    
-    db = SessionLocal()
-    db_item = TransactionDB(
-        title=item.title,
-        amount=item.amount,
-        type=item.type,
-        category=item.category if item.category.strip() else "Разное"
-    )
-    db.add(db_item)
-    db.commit()
-    db.refresh(db_item)
-    db.close()
-    return db_item
-
-@app.delete("/api/transactions/{item_id}")
-def delete_transaction(item_id: int):
-    db = SessionLocal()
-    item = db.query(TransactionDB).filter(TransactionDB.id == item_id).first()
-    if not item:
-        db.close()
-        raise HTTPException(status_code=404, detail="Запись не найдена")
-    db.delete(item)
-    db.commit()
-    db.close()
-    return {"status": "success"}
