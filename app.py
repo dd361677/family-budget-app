@@ -1,12 +1,21 @@
+import os
+from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
 from pydantic import BaseModel
-from datetime import datetime
 
-DATABASE_URL = "sqlite:///./budget.db"
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./budget.db")
+
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+if "sqlite" in DATABASE_URL:
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+else:
+    engine = create_engine(DATABASE_URL)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -17,19 +26,18 @@ class TransactionDB(Base):
     title = Column(String, nullable=False)
     amount = Column(Float, nullable=False)
     type = Column(String, nullable=False)  # "income" или "expense"
-    category = Column(String, default="Общее")
+    category = Column(String, default="Разное")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
-# Pydantic схема для валидации входящих данных
 class TransactionCreate(BaseModel):
     title: str
     amount: float
-    type: str  # 'income' или 'expense'
-    category: str = "Общее"
+    type: str
+    category: str = "Разное"
 
 @app.get("/", response_class=HTMLResponse)
 def read_root():
@@ -69,7 +77,7 @@ def add_transaction(item: TransactionCreate):
         title=item.title,
         amount=item.amount,
         type=item.type,
-        category=item.category
+        category=item.category if item.category.strip() else "Разное"
     )
     db.add(db_item)
     db.commit()
