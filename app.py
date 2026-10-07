@@ -2,31 +2,25 @@ import os
 import csv
 import io
 from typing import List, Optional
-from datetime import datetime
-from fastapi import FastAPI, Depends, HTTPException, Query
+from datetime import datetime, date
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Date
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
-# База данных
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./finpulse.db")
+# Инициализация БД (SQLite по умолчанию)
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./finpulse_elite.db")
 
 engine_args = {}
-if DATABASE_URL.startswith("postgresql") and "pooler.supabase" in DATABASE_URL:
-    engine_args["connect_args"] = {"prepare_threshold": None}
+if DATABASE_URL.startswith("sqlite"):
+    engine_args["connect_args"] = {"check_same_thread": False}
 
 engine = create_engine(DATABASE_URL, **engine_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 # --- Модели Таблиц БД ---
-
-class CategoryBudgetDB(Base):
-    __tablename__ = "category_budgets"
-    id = Column(Integer, primary_key=True, index=True)
-    category = Column(String, unique=True, nullable=False, index=True)
-    allocated_amount = Column(Float, default=0.0)
 
 class TransactionDB(Base):
     __tablename__ = "transactions"
@@ -37,6 +31,12 @@ class TransactionDB(Base):
     category = Column(String, nullable=False, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class CategoryBudgetDB(Base):
+    __tablename__ = "category_budgets"
+    id = Column(Integer, primary_key=True, index=True)
+    category = Column(String, unique=True, nullable=False)
+    allocated_amount = Column(Float, default=0.0)
+
 class GoalDB(Base):
     __tablename__ = "goals"
     id = Column(Integer, primary_key=True, index=True)
@@ -44,9 +44,17 @@ class GoalDB(Base):
     target_amount = Column(Float, nullable=False)
     current_amount = Column(Float, default=0.0)
 
+class SubscriptionDB(Base):
+    __tablename__ = "subscriptions"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, nullable=False)
+    amount = Column(Float, nullable=False)
+    billing_day = Column(Integer, nullable=False)  # День месяца (1-31)
+    category = Column(String, default="Подписки")
+
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="FinPulse 360 — Financial Management System")
+app = FastAPI(title="FinPulse Elite — Financial Management Platform")
 
 def get_db():
     db = SessionLocal()
@@ -89,10 +97,21 @@ class GoalCreate(BaseModel):
     target_amount: float
     current_amount: float = 0.0
 
+class GoalResponse(GoalCreate):
+    id: int
+    class Config:
+        from_attributes = True
+
 class GoalDeposit(BaseModel):
     amount: float
 
-class GoalResponse(GoalCreate):
+class SubscriptionCreate(BaseModel):
+    title: str
+    amount: float
+    billing_day: int
+    category: str = "Подписки"
+
+class SubscriptionResponse(SubscriptionCreate):
     id: int
     class Config:
         from_attributes = True
@@ -106,11 +125,8 @@ def read_root():
 # --- Транзакции ---
 
 @app.get("/api/transactions", response_model=List[TransactionResponse])
-def get_transactions(type: Optional[str] = None, db: Session = Depends(get_db)):
-    query = db.query(TransactionDB)
-    if type in ["income", "expense"]:
-        query = query.filter(TransactionDB.type == type)
-    return query.order_by(TransactionDB.created_at.desc()).all()
+def get_transactions(db: Session = Depends(get_db)):
+    return db.query(TransactionDB).order_by(TransactionDB.created_at.desc()).all()
 
 @app.post("/api/transactions", response_model=TransactionResponse)
 def create_transaction(tx: TransactionCreate, db: Session = Depends(get_db)):
@@ -123,9 +139,10 @@ def create_transaction(tx: TransactionCreate, db: Session = Depends(get_db)):
     )
     db.add(db_tx)
     
+    # Если это расход и категории ещё нет в бюджетах — создадим базовую запись
     if tx.type == "expense":
-        existing_budget = db.query(CategoryBudgetDB).filter_by(category=cat_clean).first()
-        if not existing_budget:
+        existing_b = db.query(CategoryBudgetDB).filter_by(category=cat_clean).first()
+        if not existing_b:
             db.add(CategoryBudgetDB(category=cat_clean, allocated_amount=0.0))
             
     db.commit()
@@ -154,9 +171,9 @@ def delete_transaction(tx_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Транзакция не найдена")
     db.delete(tx)
     db.commit()
-    return {"status": "success", "message": "Транзакция успешно удалена"}
+    return {"status": "success", "message": "Транзакция удалена"}
 
-# --- Бюджеты и Конверты ---
+# --- Бюджеты ---
 
 @app.get("/api/budgets", response_model=List[BudgetResponse])
 def get_budgets(db: Session = Depends(get_db)):
@@ -184,10 +201,10 @@ def delete_budget(cat_name: str, db: Session = Depends(get_db)):
     if b:
         db.delete(b)
         db.commit()
-        return {"status": "success", "message": f"Бюджет для '{cat_name}' удален"}
+        return {"status": "success"}
     raise HTTPException(status_code=404, detail="Категория не найдена")
 
-# --- Накопления и Цели ---
+# --- Цели ---
 
 @app.get("/api/goals", response_model=List[GoalResponse])
 def get_goals(db: Session = Depends(get_db)):
@@ -202,11 +219,11 @@ def create_goal(goal: GoalCreate, db: Session = Depends(get_db)):
     return new_g
 
 @app.post("/api/goals/{goal_id}/deposit", response_model=GoalResponse)
-def deposit_to_goal(goal_id: int, deposit: GoalDeposit, db: Session = Depends(get_db)):
+def deposit_goal(goal_id: int, dep: GoalDeposit, db: Session = Depends(get_db)):
     g = db.query(GoalDB).filter(GoalDB.id == goal_id).first()
     if not g:
         raise HTTPException(status_code=404, detail="Цель не найдена")
-    g.current_amount += deposit.amount
+    g.current_amount += dep.amount
     db.commit()
     db.refresh(g)
     return g
@@ -218,31 +235,57 @@ def delete_goal(goal_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Цель не найдена")
     db.delete(g)
     db.commit()
-    return {"status": "success", "message": "Цель удалена"}
+    return {"status": "success"}
 
-# --- Сводка и Аналитика ---
+# --- Регулярные Подписки ---
+
+@app.get("/api/subscriptions", response_model=List[SubscriptionResponse])
+def get_subscriptions(db: Session = Depends(get_db)):
+    return db.query(SubscriptionDB).all()
+
+@app.post("/api/subscriptions", response_model=SubscriptionResponse)
+def create_subscription(sub: SubscriptionCreate, db: Session = Depends(get_db)):
+    new_sub = SubscriptionDB(**sub.model_dump())
+    db.add(new_sub)
+    db.commit()
+    db.refresh(new_sub)
+    return new_sub
+
+@app.delete("/api/subscriptions/{sub_id}")
+def delete_subscription(sub_id: int, db: Session = Depends(get_db)):
+    s = db.query(SubscriptionDB).filter(SubscriptionDB.id == sub_id).first()
+    if not s:
+        raise HTTPException(status_code=404, detail="Подписка не найдена")
+    db.delete(s)
+    db.commit()
+    return {"status": "success"}
+
+# --- Сводный Отчет ---
 
 @app.get("/api/summary")
 def get_summary(db: Session = Depends(get_db)):
     transactions = db.query(TransactionDB).all()
     budgets = db.query(CategoryBudgetDB).all()
     goals = db.query(GoalDB).all()
+    subs = db.query(SubscriptionDB).all()
 
     total_income = sum(t.amount for t in transactions if t.type == "income")
     total_expense = sum(t.amount for t in transactions if t.type == "expense")
     total_allocated = sum(b.allocated_amount for b in budgets)
     total_saved_goals = sum(g.current_amount for g in goals)
+    monthly_subs = sum(s.amount for s in subs)
 
     savings_rate = round(((total_income - total_expense) / total_income * 100), 1) if total_income > 0 else 0
-    health_score = min(100, max(0, int(savings_rate * 1.5 + (20 if total_allocated > 0 else 0))))
+    health_score = min(100, max(0, int(savings_rate * 1.4 + (20 if total_allocated > 0 else 0))))
 
     return {
         "total_income": total_income,
         "total_expense": total_expense,
         "total_allocated": total_allocated,
-        "unallocated_income": total_income - total_allocated,
-        "real_balance": total_income - total_expense,
+        "unallocated_income": max(0, total_income - total_allocated),
+        "net_balance": total_income - total_expense,
         "total_saved_goals": total_saved_goals,
+        "monthly_subscriptions": monthly_subs,
         "savings_rate": savings_rate,
         "health_score": health_score
     }
@@ -263,5 +306,5 @@ def export_csv(db: Session = Depends(get_db)):
     return StreamingResponse(
         io.BytesIO(output.getvalue().encode('utf-8-sig')),
         media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=financial_report.csv"}
+        headers={"Content-Disposition": "attachment; filename=FinPulse_Report.csv"}
     )
