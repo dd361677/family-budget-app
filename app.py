@@ -1,13 +1,16 @@
 import os
-from typing import List
+import csv
+import io
+from typing import List, Optional
 from datetime import datetime
-from fastapi import FastAPI, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db")
+# База данных
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./finpulse.db")
 
 engine_args = {}
 if DATABASE_URL.startswith("postgresql") and "pooler.supabase" in DATABASE_URL:
@@ -17,18 +20,16 @@ engine = create_engine(DATABASE_URL, **engine_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- Таблицы БД ---
+# --- Модели Таблиц БД ---
 
 class CategoryBudgetDB(Base):
     __tablename__ = "category_budgets"
-
     id = Column(Integer, primary_key=True, index=True)
     category = Column(String, unique=True, nullable=False, index=True)
     allocated_amount = Column(Float, default=0.0)
 
 class TransactionDB(Base):
     __tablename__ = "transactions"
-
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String, nullable=False)
     amount = Column(Float, nullable=False)
@@ -36,9 +37,16 @@ class TransactionDB(Base):
     category = Column(String, nullable=False, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class GoalDB(Base):
+    __tablename__ = "goals"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, nullable=False)
+    target_amount = Column(Float, nullable=False)
+    current_amount = Column(Float, default=0.0)
+
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="ProFinance Analytics Dashboard")
+app = FastAPI(title="FinPulse 360 — Financial Management System")
 
 def get_db():
     db = SessionLocal()
@@ -47,13 +55,19 @@ def get_db():
     finally:
         db.close()
 
-# --- Схемы данных ---
+# --- Pydantic Схемы ---
 
 class TransactionCreate(BaseModel):
     title: str
     amount: float
     type: str
     category: str
+
+class TransactionUpdate(BaseModel):
+    title: Optional[str] = None
+    amount: Optional[float] = None
+    type: Optional[str] = None
+    category: Optional[str] = None
 
 class TransactionResponse(TransactionCreate):
     id: int
@@ -70,40 +84,79 @@ class BudgetResponse(BudgetCreate):
     class Config:
         from_attributes = True
 
+class GoalCreate(BaseModel):
+    title: str
+    target_amount: float
+    current_amount: float = 0.0
+
+class GoalDeposit(BaseModel):
+    amount: float
+
+class GoalResponse(GoalCreate):
+    id: int
+    class Config:
+        from_attributes = True
+
 # --- API Эндпоинты ---
 
 @app.get("/")
 def read_root():
     return FileResponse("index.html")
 
+# --- Транзакции ---
+
 @app.get("/api/transactions", response_model=List[TransactionResponse])
-def get_transactions(db: Session = Depends(get_db)):
-    return db.query(TransactionDB).order_by(TransactionDB.created_at.desc()).all()
+def get_transactions(type: Optional[str] = None, db: Session = Depends(get_db)):
+    query = db.query(TransactionDB)
+    if type in ["income", "expense"]:
+        query = query.filter(TransactionDB.type == type)
+    return query.order_by(TransactionDB.created_at.desc()).all()
 
 @app.post("/api/transactions", response_model=TransactionResponse)
 def create_transaction(tx: TransactionCreate, db: Session = Depends(get_db)):
-    db_tx = TransactionDB(**tx.model_dump())
+    cat_clean = tx.category.strip()
+    db_tx = TransactionDB(
+        title=tx.title,
+        amount=tx.amount,
+        type=tx.type,
+        category=cat_clean
+    )
     db.add(db_tx)
     
-    # Автоматически создаём бюджетную категорию, если её ещё не было
     if tx.type == "expense":
-        cat_clean = tx.category.strip()
-        existing = db.query(CategoryBudgetDB).filter_by(category=cat_clean).first()
-        if not existing:
+        existing_budget = db.query(CategoryBudgetDB).filter_by(category=cat_clean).first()
+        if not existing_budget:
             db.add(CategoryBudgetDB(category=cat_clean, allocated_amount=0.0))
             
     db.commit()
     db.refresh(db_tx)
     return db_tx
 
+@app.put("/api/transactions/{tx_id}", response_model=TransactionResponse)
+def update_transaction(tx_id: int, tx_data: TransactionUpdate, db: Session = Depends(get_db)):
+    tx = db.query(TransactionDB).filter(TransactionDB.id == tx_id).first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Транзакция не найдена")
+    
+    if tx_data.title is not None: tx.title = tx_data.title
+    if tx_data.amount is not None: tx.amount = tx_data.amount
+    if tx_data.type is not None: tx.type = tx_data.type
+    if tx_data.category is not None: tx.category = tx_data.category.strip()
+    
+    db.commit()
+    db.refresh(tx)
+    return tx
+
 @app.delete("/api/transactions/{tx_id}")
 def delete_transaction(tx_id: int, db: Session = Depends(get_db)):
     tx = db.query(TransactionDB).filter(TransactionDB.id == tx_id).first()
     if not tx:
-        raise HTTPException(status_code=404, detail="Запись не найдена")
+        raise HTTPException(status_code=404, detail="Транзакция не найдена")
     db.delete(tx)
     db.commit()
-    return {"status": "success"}
+    return {"status": "success", "message": "Транзакция успешно удалена"}
+
+# --- Бюджеты и Конверты ---
 
 @app.get("/api/budgets", response_model=List[BudgetResponse])
 def get_budgets(db: Session = Depends(get_db)):
@@ -131,21 +184,84 @@ def delete_budget(cat_name: str, db: Session = Depends(get_db)):
     if b:
         db.delete(b)
         db.commit()
-    return {"status": "success"}
+        return {"status": "success", "message": f"Бюджет для '{cat_name}' удален"}
+    raise HTTPException(status_code=404, detail="Категория не найдена")
+
+# --- Накопления и Цели ---
+
+@app.get("/api/goals", response_model=List[GoalResponse])
+def get_goals(db: Session = Depends(get_db)):
+    return db.query(GoalDB).all()
+
+@app.post("/api/goals", response_model=GoalResponse)
+def create_goal(goal: GoalCreate, db: Session = Depends(get_db)):
+    new_g = GoalDB(**goal.model_dump())
+    db.add(new_g)
+    db.commit()
+    db.refresh(new_g)
+    return new_g
+
+@app.post("/api/goals/{goal_id}/deposit", response_model=GoalResponse)
+def deposit_to_goal(goal_id: int, deposit: GoalDeposit, db: Session = Depends(get_db)):
+    g = db.query(GoalDB).filter(GoalDB.id == goal_id).first()
+    if not g:
+        raise HTTPException(status_code=404, detail="Цель не найдена")
+    g.current_amount += deposit.amount
+    db.commit()
+    db.refresh(g)
+    return g
+
+@app.delete("/api/goals/{goal_id}")
+def delete_goal(goal_id: int, db: Session = Depends(get_db)):
+    g = db.query(GoalDB).filter(GoalDB.id == goal_id).first()
+    if not g:
+        raise HTTPException(status_code=404, detail="Цель не найдена")
+    db.delete(g)
+    db.commit()
+    return {"status": "success", "message": "Цель удалена"}
+
+# --- Сводка и Аналитика ---
 
 @app.get("/api/summary")
 def get_summary(db: Session = Depends(get_db)):
     transactions = db.query(TransactionDB).all()
     budgets = db.query(CategoryBudgetDB).all()
+    goals = db.query(GoalDB).all()
 
     total_income = sum(t.amount for t in transactions if t.type == "income")
     total_expense = sum(t.amount for t in transactions if t.type == "expense")
     total_allocated = sum(b.allocated_amount for b in budgets)
+    total_saved_goals = sum(g.current_amount for g in goals)
+
+    savings_rate = round(((total_income - total_expense) / total_income * 100), 1) if total_income > 0 else 0
+    health_score = min(100, max(0, int(savings_rate * 1.5 + (20 if total_allocated > 0 else 0))))
 
     return {
         "total_income": total_income,
         "total_expense": total_expense,
         "total_allocated": total_allocated,
         "unallocated_income": total_income - total_allocated,
-        "real_balance": total_income - total_expense
+        "real_balance": total_income - total_expense,
+        "total_saved_goals": total_saved_goals,
+        "savings_rate": savings_rate,
+        "health_score": health_score
     }
+
+# --- Экспорт в CSV ---
+
+@app.get("/api/export/csv")
+def export_csv(db: Session = Depends(get_db)):
+    transactions = db.query(TransactionDB).order_by(TransactionDB.created_at.desc()).all()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["ID", "Название", "Сумма (₸)", "Тип", "Категория", "Дата"])
+    
+    for t in transactions:
+        writer.writerow([t.id, t.title, t.amount, t.type, t.category, t.created_at.strftime("%Y-%m-%d %H:%M:%S")])
+        
+    output.seek(0)
+    return StreamingResponse(
+        io.BytesIO(output.getvalue().encode('utf-8-sig')),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=financial_report.csv"}
+    )
